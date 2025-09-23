@@ -30,7 +30,18 @@ interface RejectedOriginalStackFrame extends OriginalStackFrameResponse {
 export type OriginalStackFrame =
   | ResolvedOriginalStackFrame
   | RejectedOriginalStackFrame
-
+const __toPosix = (p: string) => p.replace(/\\/g, '/')
+const __decodeFileUrl = (input: string) => {
+  if (!input?.startsWith('file://')) return input
+  try {
+    // file://C%3A/... -> file://C:/...
+    return decodeURI(input)
+  } catch {
+    return input
+  }
+}
+const __normalizeForLookup = (file?: string) =>
+  file ? __toPosix(__decodeFileUrl(file)) : file
 function getOriginalStackFrame(
   source: StackFrame,
   response: OriginalStackFrameResponseResult
@@ -84,8 +95,13 @@ export async function getOriginalStackFrames(
   type: 'server' | 'edge-server' | null,
   isAppDir: boolean
 ): Promise<readonly OriginalStackFrame[]> {
+  const normalizedFrames = frames.map((f) => ({
+    ...f,
+    file: __normalizeForLookup(f.file ?? undefined) ?? null,
+  }))
+
   const req: OriginalStackFramesRequest = {
-    frames,
+    frames: normalizedFrames,
     isServer: type === 'server',
     isEdgeServer: type === 'edge-server',
     isAppDirectory: isAppDir,
@@ -128,15 +144,15 @@ export async function getOriginalStackFrames(
 export function getFrameSource(frame: StackFrame): string {
   if (!frame.file) return ''
 
-  const isWebpackFrame = isWebpackInternalResource(frame.file)
-
+  const displayFile = __normalizeForLookup(frame.file)
+  const isWebpackFrame = isWebpackInternalResource(displayFile ?? '')
   let str = ''
   // Skip URL parsing for webpack internal file paths.
   if (isWebpackFrame) {
-    str = formatFrameSourceFile(frame.file)
+    str = formatFrameSourceFile(displayFile ?? '')
   } else {
     try {
-      const u = new URL(frame.file)
+      const u = new URL(displayFile ?? '')
 
       let parsedPath = ''
       // Strip the origin for same-origin scripts.
@@ -155,11 +171,11 @@ export function getFrameSource(frame: StackFrame): string {
       parsedPath += u.pathname
       str = formatFrameSourceFile(parsedPath)
     } catch {
-      str = formatFrameSourceFile(frame.file)
+      str = formatFrameSourceFile(displayFile ?? '')
     }
   }
 
-  if (!isWebpackInternalResource(frame.file) && frame.line1 != null) {
+  if (!isWebpackInternalResource(displayFile ?? '') && frame.line1 != null) {
     // We don't need line and column numbers for anonymous sources because
     // there's no entrypoint for the location anyway.
     if (str && frame.file !== '<anonymous>') {

@@ -12,8 +12,13 @@ export const CallStackFrame: React.FC<{
 
   const f = frame.originalStackFrame ?? frame.sourceStackFrame
   const hasSource = Boolean(frame.originalCodeFrame)
+  // Consider app code "openable" even if originalCodeFrame is null (Windows)
+  const isProjectRelAppPath =
+    typeof f.file === 'string' &&
+    (/^(src\/)?app\//.test(f.file) || /^(src\/)?pages\//.test(f.file))
+  const canOpen = !frame.ignored && isProjectRelAppPath
   const open = useOpenInEditor(
-    hasSource
+    canOpen
       ? {
           file: f.file,
           line1: f.line1 ?? 1,
@@ -38,7 +43,7 @@ export const CallStackFrame: React.FC<{
     >
       <div className="call-stack-frame-method-name">
         <HotlinkedText text={f.methodName} />
-        {hasSource && (
+        {canOpen && (
           <button
             onClick={open}
             className="open-in-editor-button"

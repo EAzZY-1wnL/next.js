@@ -25,12 +25,96 @@ import { findSourceMap, type SourceMap } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { inspect } from 'node:util'
 
+// --- Windows/URL normalization helpers (server side) ---
+// const toPosix = (p: string) => p.replace(/\\/g, '/')
+const decodeMaybe = (s: string | undefined) => {
+  if (!s) return s
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    return s
+  }
+}
+function normalizeToProjectRelative(
+  mapped: string,
+  projectPath: string
+): string {
+  try {
+    // Convert Windows absolute paths (C:\...) to file URLs so fileURLToPath works uniformly
+    if (!mapped.startsWith('file://') && path.isAbsolute(mapped)) {
+      mapped = pathToFileURL(mapped).href
+    }
+    if (mapped.startsWith('file://')) {
+      const abs = fileURLToPath(mapped)
+      return path.relative(projectPath, abs).replace(/\\/g, '/')
+    }
+  } catch {
+    // fall through
+  }
+  // If it's already project-relative or some non-file scheme, just normalize slashes
+  return mapped.replace(/\\/g, '/')
+}
+
+const ensureFileUrl = (input: string | undefined): string | undefined => {
+  if (!input) return input
+  const s = decodeMaybe(input)!
+  if (s.startsWith('file://')) return s
+  // Windows absolute like C:/...  (POSIX absolute /... handled by URL too)
+  if (/^[A-Za-z]:\//.test(s) || s.startsWith('/')) {
+    return pathToFileURL(s).href
+  }
+  // passthrough other schemes (http:, turbopack:, node:, etc.)
+  return s
+}
+async function loadSourceMapPayload(
+  project: Project,
+  sourceUrlHref: string
+): Promise<ModernSourceMapPayload | undefined> {
+  // 1) Try Node’s cache (native)
+  try {
+    const native = findSourceMap(sourceUrlHref)?.payload as
+      | ModernSourceMapPayload
+      | undefined
+    if (native) return native
+  } catch {
+    // ignore; we'll fall back to Turbopack
+  }
+
+  // 2) Ask Turbopack directly
+  try {
+    const smString = await project.getSourceMap(sourceUrlHref)
+    if (smString) {
+      return JSON.parse(smString) as ModernSourceMapPayload
+    }
+  } catch {
+    // ignore; final fallback is "undefined"
+  }
+
+  return undefined
+}
+function heuristicSourceFromChunkPath(chunkPath: string): string | null {
+  const p = chunkPath.replace(/\\/g, '/')
+  if (!p.includes('/src_app_') && !p.includes('/src_pages_')) return null
+
+  const file = p.split('/').pop() || ''
+  // matches: src_app_Crash_tsx_<hash>._.js OR src_pages_index_tsx_<hash>._.js
+  const m = file.match(/^src_(app|pages)_(.+?)_(tsx|ts|jsx|js)_/i)
+  if (!m) return null
+  const [, root, underscored, ext] = m
+  const pathPart = underscored.replace(/_/g, '/')
+  return `src/${root}/${pathPart}.${ext}`
+}
 function shouldIgnorePath(modulePath: string): boolean {
   return (
     modulePath.includes('node_modules') ||
     // Only relevant for when Next.js is symlinked e.g. in the Next.js monorepo
     modulePath.includes('next/dist') ||
-    modulePath.startsWith('node:')
+    modulePath.includes('_next_dist_compiled_') ||
+    modulePath.startsWith('node:') ||
+    // ignore compiled vendor chunks (react-dom, etc) in .next/static/chunks
+    /[\\/]\.next[\\/]static[\\/]chunks[\\/]/i.test(modulePath) ||
+    /react-dom/i.test(modulePath) ||
+    /_compiled_react-dom/i.test(modulePath)
   )
 }
 
@@ -40,6 +124,7 @@ const currentSourcesByFile: Map<string, Promise<string | null>> = new Map()
  */
 async function batchedTraceSource(
   project: Project,
+  projectPath: string,
   frame: TurbopackStackFrame
 ): Promise<{ frame: IgnorableStackFrame; source: string | null } | undefined> {
   const file = frame.file
@@ -54,7 +139,7 @@ async function batchedTraceSource(
   if (file.startsWith('node:')) {
     return {
       frame: {
-        file,
+        file: file,
         line1: frame.line ?? null,
         column1: frame.column ?? null,
         methodName: frame.methodName ?? '<unknown>',
@@ -71,7 +156,7 @@ async function batchedTraceSource(
   if (!sourceFrame) {
     return {
       frame: {
-        file,
+        file: normalizeToProjectRelative(file, projectPath)!,
         line1: frame.line ?? null,
         column1: frame.column ?? null,
         methodName: frame.methodName ?? '<unknown>',
@@ -83,13 +168,29 @@ async function batchedTraceSource(
   }
 
   let source = null
-  const originalFile = sourceFrame.originalFile
+  const originalFile = sourceFrame.originalFile ?? null
+  // Prefer original file if present; otherwise use the traced file.
+  const preferred = sourceFrame.originalFile ?? sourceFrame.file
 
+  const normalizedPreferred = preferred
+    ? normalizeToProjectRelative(preferred, projectPath)!
+    : null
+  // const preferredFile = originalFile ?? sourceFrame.file
+  let preferredFile = originalFile ?? sourceFrame.file
+  if (!originalFile && sourceFrame.file) {
+    const guess = heuristicSourceFromChunkPath(sourceFrame.file)
+    if (guess) {
+      console.log('[overlay] heuristic mapped', sourceFrame.file, '->', guess)
+      preferredFile = guess
+    }
+  }
   // Don't look up source for node_modules or internals. These can often be large bundled files.
   const ignored =
     shouldIgnorePath(originalFile ?? sourceFrame.file) ||
-    // isInternal means resource starts with turbopack:///[turbopack]
-    !!sourceFrame.isInternal
+    !!sourceFrame.isInternal ||
+    /[\\/]\.next[\\/]static[\\/]chunks[\\/].*react-dom/i.test(preferredFile) ||
+    /[\\/]_compiled_react-dom/i.test(preferredFile)
+
   if (originalFile && !ignored) {
     let sourcePromise = currentSourcesByFile.get(originalFile)
     if (!sourcePromise) {
@@ -106,7 +207,7 @@ async function batchedTraceSource(
 
   // TODO: get ignoredList from turbopack source map
   const ignorableFrame: IgnorableStackFrame = {
-    file: sourceFrame.file,
+    file: normalizedPreferred ?? sourceFrame.file,
     line1: sourceFrame.line ?? null,
     column1: sourceFrame.column ?? null,
     methodName:
@@ -140,8 +241,7 @@ function createStackFrames(
 
   return frames
     .map((frame): TurbopackStackFrame | undefined => {
-      const file = parseFile(frame.file)
-
+      const file = ensureFileUrl(parseFile(frame.file))
       if (!file) {
         return undefined
       }
@@ -160,7 +260,7 @@ function createStackFrames(
 function createStackFrame(
   searchParams: URLSearchParams
 ): TurbopackStackFrame | undefined {
-  const file = parseFile(searchParams.get('file'))
+  const file = ensureFileUrl(parseFile(searchParams.get('file')))
 
   if (!file) {
     return undefined
@@ -179,19 +279,21 @@ function createStackFrame(
  * @returns 1-based lines and 1-based columns
  */
 async function nativeTraceSource(
-  frame: TurbopackStackFrame
+  project: Project,
+  frame: TurbopackStackFrame,
+  projectPath: string
 ): Promise<{ frame: IgnorableStackFrame; source: string | null } | undefined> {
-  const sourceURL = frame.file
-  let sourceMapPayload: ModernSourceMapPayload | undefined
-  try {
-    sourceMapPayload = findSourceMap(sourceURL)?.payload
-  } catch (cause) {
-    throw new Error(
-      `${sourceURL}: Invalid source map. Only conformant source maps can be used to find the original code.`,
-      { cause }
-    )
+  let sourceURL = ensureFileUrl(frame.file) || frame.file
+  // If we still don't have a scheme (relative like ".next/static/..."),
+  // resolve it against the project root and turn it into a file:// URL
+  if (!/^[a-zA-Z]+:\/\//.test(sourceURL)) {
+    const abs = path.isAbsolute(sourceURL)
+      ? sourceURL
+      : path.join(projectPath, sourceURL.replace(/^[/\\]+/, ''))
+    sourceURL = pathToFileURL(abs).href
   }
 
+  const sourceMapPayload = await loadSourceMapPayload(project, sourceURL)
   if (sourceMapPayload !== undefined) {
     let consumer: SourceMapConsumer
     try {
@@ -237,6 +339,14 @@ async function nativeTraceSource(
       )
 
       // TODO(veil): Upstream a method to sourcemap consumer that immediately says if a frame is ignored or not.
+
+      // 1) project-relative mapping (works for file:///C:/… and C:\…)
+      const mappedFile = normalizeToProjectRelative(
+        originalPosition.source!,
+        projectPath
+      )
+
+      // 2) decide ignored
       let ignored = false
       if (applicableSourceMap === undefined) {
         console.error(
@@ -245,38 +355,62 @@ async function nativeTraceSource(
         )
       } else {
         // TODO: O(n^2). Consider moving `ignoreList` into a Set
-        const sourceIndex = applicableSourceMap.sources.indexOf(
+
+        const sourceIdx = applicableSourceMap.sources.indexOf(
           originalPosition.source!
         )
         ignored =
-          applicableSourceMap.ignoreList?.includes(sourceIndex) ??
-          // When sourcemap is not available, fallback to checking `frame.file`.
-          // e.g. In pages router, nextjs server code is not bundled into the page.
-          shouldIgnorePath(frame.file)
+          (applicableSourceMap.ignoreList?.includes(sourceIdx) ?? false) ||
+          // fallback (pages router/react-dom etc.)
+          // shouldIgnorePath(frame.file)
+          shouldIgnorePath(mappedFile)
+      }
+
+      // 3) collapse vendor frames to match webpack/mac
+      if (
+        /(^|[\\/])\.next([\\/])static([\\/])chunks([\\/]).*react-dom/i.test(
+          frame.file
+        ) ||
+        /_compiled_react-dom/i.test(frame.file) ||
+        /(^|\/)node_modules\//i.test(mappedFile)
+      ) {
+        ignored = true
       }
 
       const originalStackFrame: IgnorableStackFrame = {
         methodName:
-          // We ignore the sourcemapped name since it won't be the correct name.
-          // The callsite will point to the column of the variable name instead of the
-          // name of the enclosing function.
-          // TODO(NDX-531): Spy on prepareStackTrace to get the enclosing line number for method name mapping.
           frame.methodName
             ?.replace('__WEBPACK_DEFAULT_EXPORT__', 'default')
             ?.replace('__webpack_exports__.', '') || '<unknown>',
-        file: originalPosition.source,
+        file: mappedFile,
         line1: originalPosition.line,
         column1:
           originalPosition.column === null ? null : originalPosition.column + 1,
-        // TODO: c&p from async createOriginalStackFrame but why not frame.arguments?
         arguments: [],
         ignored,
       }
 
-      return {
-        frame: originalStackFrame,
-        source: sourceContent,
-      }
+      return { frame: originalStackFrame, source: sourceContent }
+    }
+  }
+
+  const guess = heuristicSourceFromChunkPath(frame.file)
+  if (guess) {
+    const mapped = normalizeToProjectRelative(guess, projectPath)
+    return {
+      frame: {
+        methodName:
+          frame.methodName
+            ?.replace('__WEBPACK_DEFAULT_EXPORT__', 'default')
+            ?.replace('__webpack_exports__.', '') || '<unknown>',
+        file: mapped,
+        line1: frame.line ?? null,
+        column1: frame.column ?? null,
+        arguments: [],
+        ignored:
+          /(^|\/)node_modules\//i.test(mapped) || shouldIgnorePath(mapped),
+      },
+      source: null,
     }
   }
 
@@ -289,25 +423,32 @@ async function createOriginalStackFrame(
   frame: TurbopackStackFrame
 ): Promise<OriginalStackFrameResponse | null> {
   const traced =
-    (await nativeTraceSource(frame)) ??
-    // TODO(veil): When would the bundler know more than native?
-    // If it's faster, try the bundler first and fall back to native later.
-    (await batchedTraceSource(project, frame))
+    (await nativeTraceSource(project, frame, projectPath)) ??
+    (await batchedTraceSource(project, projectPath, frame))
   if (!traced) {
     return null
   }
 
   let normalizedStackFrameLocation = traced.frame.file
   if (
-    normalizedStackFrameLocation !== null &&
-    normalizedStackFrameLocation.startsWith('file://')
+    normalizedStackFrameLocation &&
+    normalizedStackFrameLocation.startsWith('.next/static/chunks/')
   ) {
-    normalizedStackFrameLocation = path.relative(
-      projectPath,
-      fileURLToPath(normalizedStackFrameLocation)
+    const guess = heuristicSourceFromChunkPath(normalizedStackFrameLocation)
+    if (guess) {
+      console.log(
+        '[overlay] final guard mapped',
+        normalizedStackFrameLocation,
+        '->',
+        guess
+      )
+      normalizedStackFrameLocation = guess
+    }
+    normalizedStackFrameLocation = normalizeToProjectRelative(
+      normalizedStackFrameLocation,
+      projectPath
     )
   }
-
   return {
     originalStackFrame: {
       arguments: traced.frame.arguments,
@@ -370,11 +511,7 @@ export function getOverlayMiddleware({
       let openEditorResult
       if (isAppRelativePath) {
         const relativeFilePath = searchParams.get('file') || ''
-        const appPath = path.join(
-          'app',
-          isSrcDir ? 'src' : '',
-          relativeFilePath
-        )
+        const appPath = path.join(isSrcDir ? 'src' : '', relativeFilePath)
         openEditorResult = await openFileInEditor(appPath, 1, 1, projectPath)
       } else {
         const frame = createStackFrame(searchParams)
